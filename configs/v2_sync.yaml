@@ -1,0 +1,66 @@
+# A/B 对照配置：与 v2.yaml 完全相同，仅把 async_pipeline 关掉
+# 跑同一份代码、同一个模型规模，比较 sync (graph-opt 等价) vs async (1F1B) 的差异
+#
+# 用法：
+#   CONFIG=configs/v2_sync.yaml bash scripts/run_all_v2.sh ...
+#
+# 期望对比：
+#   * async-1f1b 的 total_recovery_sec 应比 sync 少 ≈ overlap_sec
+#   * 模型放大到 GPT-2 XL 后 overlap_sec 应明显 > 0（小模型时几乎为 0）
+
+model:
+  vocab_size: 50257
+  hidden_dim: 2048
+  num_heads: 16
+  num_layers_per_stage: 8
+  max_seq_len: 512
+  dropout: 0.1
+
+pp:
+  num_stages: 4
+  num_microbatches: 8
+  micro_batch_size: 4
+
+train:
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  seed: 42
+
+checkpoint:
+  keep_last: 3
+  dir: /workspace/runs/sync/ckpts
+
+injection:
+  stages_to_test: [1, 2, 3, 4]
+  repeats: 3
+  inject_at_step: 20
+
+  # ← 唯一与 v2.yaml 的差异
+  async_pipeline: false
+
+  catch_up_steps: 5
+  catch_up_tolerance: 0.05
+  activation_cache_max_steps: 1
+  retain_graph_interval: 10
+
+  nccl_timeout_sec: 60
+  recovery_nccl_timeout_sec: 60
+  recovery_port: 29501
+  coord_dir: /workspace/runs/sync/coord
+
+  # 协调器实现:
+  #   "file" → FileCoordinator(需要 4 个 pod 共享 coord_dir,默认)
+  #   "tcp"  → TCPCoordinator(只需 pod 间网络互通,不依赖共享 FS)
+  # 平台 /workspace 不是共享存储时必须用 "tcp"。
+  coordinator: tcp
+
+  # TCP coordinator 监听端口(rank 0 起 server,与 NCCL 29500 错开)
+  coord_tcp_port: 29512
+
+  # Phase B 重建 PG 用的 TCPStore 端口基址(每个 trial 用 base + k*13 + trial)
+  reinit_tcp_port_base: 29800
+
+
+output:
+  results_dir: /workspace/runs/sync/results
+  logs_dir:    /workspace/runs/sync/logs

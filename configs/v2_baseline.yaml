@@ -1,0 +1,77 @@
+# 真正的 baseline 配置 ── 等价于 pp-preempt-v2-large 的机制
+#
+# 关键差异:
+#   * retain_graph_interval: 0   ← 完全关闭图保留(走 Path B,重做 forward)
+#   * async_pipeline:        false ← 同步两阶段恢复
+# 其余模型规模与 v2.yaml / v2_sync.yaml 完全一致(GPT-2 XL 量级),
+# 这样三份 config 跑出来的数据可以横向比较,只看恢复路径差异。
+#
+# 完整三档对照:
+#   v2_baseline.yaml → activation baseline (Path B,重做 forward + 同步)
+#   v2_sync.yaml     → graph-opt           (Path A,保留图 + 同步)
+#   v2.yaml          → async-1f1b 本体     (Path A,保留图 + 1F1B 异步重叠)
+#
+# 用法:
+#   CONFIG=configs/v2_baseline.yaml bash scripts/run_all_v2.sh ...
+
+model:
+  vocab_size: 50257
+  hidden_dim: 2048
+  num_heads: 16
+  num_layers_per_stage: 8
+  max_seq_len: 512
+  dropout: 0.1
+
+pp:
+  num_stages: 4
+  num_microbatches: 8
+  micro_batch_size: 4
+
+train:
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  seed: 42
+
+checkpoint:
+  keep_last: 3
+  dir: /workspace/runs/baseline/ckpts
+
+injection:
+  stages_to_test: [1, 2, 3, 4]
+  repeats: 3
+  inject_at_step: 20
+
+  # ← 第一处关键改动:关掉 1F1B,走同步两阶段
+  async_pipeline: false
+
+  catch_up_steps: 5
+  catch_up_tolerance: 0.05
+  activation_cache_max_steps: 1
+
+  # ← 第二处关键改动:0 = 不保留图
+  # 训练阶段不再 functional_call+clone(省训练显存,但 retain 不命中);
+  # 恢复阶段 cache.has_graph(inject_step) 为 False → use_graph=False
+  # → UPSTREAM_HELPER 退化为重做 forward(Path B,等价 large 包行为)
+  retain_graph_interval: 0
+
+  nccl_timeout_sec: 60
+  recovery_nccl_timeout_sec: 60
+  recovery_port: 29501
+  coord_dir: /workspace/runs/baseline/coord
+
+  # 协调器实现:
+  #   "file" → FileCoordinator(需要 4 个 pod 共享 coord_dir,默认)
+  #   "tcp"  → TCPCoordinator(只需 pod 间网络互通,不依赖共享 FS)
+  # 平台 /workspace 不是共享存储时必须用 "tcp"。
+  coordinator: tcp
+
+  # TCP coordinator 监听端口(rank 0 起 server,与 NCCL 29500 错开)
+  coord_tcp_port: 29522
+
+  # Phase B 重建 PG 用的 TCPStore 端口基址(每个 trial 用 base + k*13 + trial)
+  reinit_tcp_port_base: 30000
+
+
+output:
+  results_dir: /workspace/runs/baseline/results
+  logs_dir:    /workspace/runs/baseline/logs

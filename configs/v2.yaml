@@ -1,0 +1,73 @@
+# PP 抢占恢复代价实验 v2 配置 — A100 80G × 4 worker, GPT-2 XL 量级
+# 完全自包含：合成数据，从零开始训练，无任何外部文件依赖
+# 平台：4 worker × 1 A100-80G-SXM4 replica（每 stage 独占一张 80GB 卡）
+#
+# 相对原 1024-hidden 配置的改动：
+#   * hidden_dim:           1024 → 2048   （≈ GPT-2 XL，单 stage forward ~100ms 量级）
+#   * num_layers_per_stage:    4 →    8   （总 32 层 Transformer ≈ 1.6B params）
+#   * num_microbatches:        4 →    8   （拉长流水线，让 async-1f1b 的 overlap 收益放大）
+#   * inject_at_step:         50 →   20   （20 % 10 == 0 ✓，warmup 缩到 19 步控总时长）
+
+model:
+  vocab_size: 50257           # GPT-2 词表大小
+  hidden_dim: 2048
+  num_heads: 16               # head_dim = 128，与 GPT-2 XL 一致
+  num_layers_per_stage: 8     # 4 stage × 8 = 32 层 Transformer，≈ 1.6B params
+  max_seq_len: 512
+  dropout: 0.1
+
+pp:
+  num_stages: 4
+  num_microbatches: 8         # ← 关键：M 越大，1F1B 的稳态重叠区间越长
+  micro_batch_size: 4
+
+train:
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  seed: 42
+
+checkpoint:
+  keep_last: 3
+  # 路径按 config 名分 namespace,避免三档(baseline/sync/async)并发跑时互相覆盖
+  dir: /workspace/runs/async/ckpts
+
+injection:
+  stages_to_test: [1, 2, 3, 4]
+  repeats: 3
+
+  # warmup = inject_at_step - 1 = 19 步
+  # 必须满足 inject_at_step % retain_graph_interval == 0，确保 inject_step 的图被保留
+  # 20 % 10 == 0  ✓
+  inject_at_step: 20
+
+  # true  → execute_recovery_async（本包默认；用于展示 1F1B 重叠收益）
+  # false → execute_recovery_sync（与 graph-opt 完全一致，A/B 对照）
+  async_pipeline: true
+
+  catch_up_steps: 5
+  catch_up_tolerance: 0.05
+  activation_cache_max_steps: 1
+
+  retain_graph_interval: 10
+
+  nccl_timeout_sec: 60
+  recovery_nccl_timeout_sec: 60
+  recovery_port: 29501
+  coord_dir: /workspace/runs/async/coord
+
+  # 协调器实现:
+  #   "file" → FileCoordinator(需要 4 个 pod 共享 coord_dir,默认)
+  #   "tcp"  → TCPCoordinator(只需 pod 间网络互通,不依赖共享 FS)
+  # 平台 /workspace 不是共享存储时必须用 "tcp"。
+  coordinator: tcp
+
+  # TCP coordinator 监听端口(rank 0 起 server,与 NCCL 29500 错开)
+  coord_tcp_port: 29502
+
+  # Phase B 重建 PG 用的 TCPStore 端口基址(每个 trial 用 base + k*13 + trial)
+  reinit_tcp_port_base: 29600
+
+
+output:
+  results_dir: /workspace/runs/async/results
+  logs_dir:    /workspace/runs/async/logs
