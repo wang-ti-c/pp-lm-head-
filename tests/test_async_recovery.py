@@ -41,27 +41,59 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 
 
-class _TinyStage(nn.Module):
-    """A 1-layer linear stage; matches the (B, S, H) tensor shape of the real stages."""
-    def __init__(self, H, V=None, is_last=False):
+class _TinyStageFirst(nn.Module):
+    """Drop-in for rank 0 — mirrors the new StageFirst dual-method API.
+
+    Note: real StageFirst.forward_embed takes token ids; this tiny version
+    accepts hidden-shape (B, S, H) tensors instead. The only tests that
+    exercise this class today (test_async_returns_required_fields,
+    test_loss_consistency_sync_vs_async) are both @pytest.mark.skip'd for
+    gloo limitations, so the type mismatch is inert. If those tests are
+    ever un-skipped, _TinyStageFirst.forward_embed must be reworked to
+    accept LongTensor[B, S] of ids.
+    """
+    def __init__(self, H, V):
+        super().__init__()
+        self.linear  = nn.Linear(H, H, bias=False)
+        self.ln_f    = nn.LayerNorm(H)
+        self.lm_head = nn.Linear(H, V, bias=False)
+
+    def forward_embed(self, x):
+        return self.linear(x)
+
+    def forward_head(self, hidden):
+        return self.lm_head(self.ln_f(hidden))
+
+
+class _TinyStageMid(nn.Module):
+    def __init__(self, H):
         super().__init__()
         self.linear = nn.Linear(H, H, bias=False)
-        self.is_last = is_last
-        if is_last and V is not None:
-            self.head = nn.Linear(H, V, bias=False)
 
     def forward(self, x):
-        x = self.linear(x)
-        if self.is_last:
-            x = self.head(x)
-        return x
+        return self.linear(x)
+
+
+class _TinyStageTail(nn.Module):
+    """Drop-in for rank K-1 — pure linear, no head."""
+    def __init__(self, H):
+        super().__init__()
+        self.linear = nn.Linear(H, H, bias=False)
+
+    def forward(self, x):
+        return self.linear(x)
 
 
 def _make_engine(rank, K, M, mb_size, seq_len, H, V):
-    """Build a PPEngine wrapped around a tiny linear stage."""
+    """Build a PPEngine wrapped around a tiny linear stage matching ring layout."""
     from pp_engine import PPEngine
     torch.manual_seed(1234 + rank)
-    stage = _TinyStage(H, V=V, is_last=(rank == K - 1))
+    if rank == 0:
+        stage = _TinyStageFirst(H, V)
+    elif rank == K - 1:
+        stage = _TinyStageTail(H)
+    else:
+        stage = _TinyStageMid(H)
     # PPEngine uses cuda.current_device(); patch device to CPU for the test.
     # We monkey-patch by giving PPEngine a CPU device after construction.
     engine = PPEngine(
