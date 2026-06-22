@@ -46,6 +46,12 @@ def plan_recovery(target_rank: int, num_stages: int) -> dict:
 
 def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
                           batch_input_ids, batch_targets, optimizer) -> dict:
+    """
+    Ring 拓扑下的同步恢复：
+      · rank 0 既驱动 embed forward，又消费 rank K-1 回传的 hidden 跑 head + loss
+      · rank K-1 退化为中间 stage 同形态（forward 完 send hidden 回 0，等 grad 回来 backward）
+      · plan_recovery 角色映射不变；UPSTREAM_HELPER 的 resend cache 行为不变
+    """
     rank    = engine.rank
     role    = plan[rank]
     K, M    = engine.K, engine.M
@@ -67,12 +73,16 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
 
     # ── Forward / resend 阶段 ─────────────────────────────────────────────────
     t0 = time.monotonic()
-    fwd_in:  list[torch.Tensor] = []
-    fwd_out: list[torch.Tensor] = []
-    losses:  list[torch.Tensor] = []
+    fwd_in:   list = []
+    fwd_out:  list = []
+    head_in:  list = []   # rank 0 only: 收到的 hidden_h3
+    losses:   list = []   # rank 0 only
 
     for mb in range(M):
         if role == RecoveryRole.UPSTREAM_HELPER:
+            # rank 0 的 UPSTREAM_HELPER 分支：只 resend cached_out 到 rank 1，
+            #   但同时 rank 0 还要兼任 head（在后面的 head loop 里处理）。
+            # 其他 rank 的 UPSTREAM_HELPER 分支与原版完全相同。
             if rank > 0:
                 _ = engine._recv_act()          # drain buffer
             cached_inp, cached_out = engine.cache.get(ckpt_step, mb)
@@ -84,16 +94,13 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
                 s = mb * engine.mb_size
                 inp = batch_input_ids[s:s + engine.mb_size].to(engine.device)
                 fwd_in.append(inp)
-                out = engine.stage(inp); fwd_out.append(out)
+                out = engine.stage.forward_embed(inp); fwd_out.append(out)
                 engine._send_act(out)
             elif rank == K - 1:
                 inp = engine._recv_act(); inp.requires_grad_(True)
                 fwd_in.append(inp)
-                logits = engine.stage(inp); fwd_out.append(logits)
-                s = mb * engine.mb_size
-                tgt = batch_targets[s:s + engine.mb_size].to(engine.device)
-                losses.append(F.cross_entropy(
-                    logits.view(-1, engine.V), tgt.view(-1)) / M)
+                out = engine.stage(inp); fwd_out.append(out)
+                engine._send_hidden_to_head(out)
             else:
                 inp = engine._recv_act(); inp.requires_grad_(True)
                 fwd_in.append(inp)
@@ -104,53 +111,91 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
             if rank == K - 1:
                 inp = engine._recv_act(); inp.requires_grad_(True)
                 fwd_in.append(inp)
-                logits = engine.stage(inp); fwd_out.append(logits)
-                s = mb * engine.mb_size
-                tgt = batch_targets[s:s + engine.mb_size].to(engine.device)
-                losses.append(F.cross_entropy(
-                    logits.view(-1, engine.V), tgt.view(-1)) / M)
+                out = engine.stage(inp); fwd_out.append(out)
+                engine._send_hidden_to_head(out)
             else:
                 inp = engine._recv_act(); inp.requires_grad_(True)
                 fwd_in.append(inp)
                 out = engine.stage(inp); fwd_out.append(out)
                 engine._send_act(out)
 
+    # ── Head / loss 阶段（仅 rank 0，per mb） ────────────────────────────────
+    # rank 0 在以下任意角色（PREEMPTED / DOWNSTREAM_VICTIM / UPSTREAM_HELPER）
+    # 都必须接收 K-1 发回的 hidden 并算 loss —— 这是 ring 拓扑下 rank 0 的固有职责。
+    # （注：target_rank=0 时 rank 0 是 PREEMPTED；target_rank!=0 时 rank 0 是 UPSTREAM_HELPER。）
+    if rank == 0:
+        for mb in range(M):
+            hidden = engine._recv_hidden_from_tail()
+            hidden.requires_grad_(True)
+            head_in.append(hidden)
+            logits = engine.stage.forward_head(hidden)
+            s   = mb * engine.mb_size
+            tgt = batch_targets[s:s + engine.mb_size].to(engine.device)
+            losses.append(F.cross_entropy(
+                logits.view(-1, engine.V), tgt.view(-1)) / M)
+
     resend_sec = time.monotonic() - t0
 
     # ── Backward / compute 阶段 ───────────────────────────────────────────────
     t0 = time.monotonic()
 
-    if role == RecoveryRole.UPSTREAM_HELPER:
+    if rank == 0:
+        # Loop 1: head backward → ring 回传 grad 启动
+        for mb in range(M):
+            losses[mb].backward()
+            engine._send_grad_to_tail(head_in[mb].grad)
+        # Loop 2: 等 grad 绕环回到 embed
+        if role == RecoveryRole.UPSTREAM_HELPER:
+            if use_graph:
+                # rank 0 的 helper 路径 A：保留图 backward
+                for mb in range(M):
+                    g_inp, g_out = engine.cache.get_graph(ckpt_step, mb)
+                    g_out.backward(engine._recv_grad())
+                    # rank 0 不向上游发 grad
+                engine.cache.release_graph_explicitly()
+            else:
+                # rank 0 的 helper 路径 B：重做 embed + backward
+                loc_in, loc_out = [], []
+                for mb in range(M):
+                    src = fwd_in[mb]
+                    inp = src.clone()
+                    loc_in.append(inp)
+                    loc_out.append(engine.stage.forward_embed(inp))
+                for mb in range(M):
+                    loc_out[mb].backward(engine._recv_grad())
+        else:
+            # rank 0 的 PREEMPTED / DOWNSTREAM_VICTIM：直接 backward 现有 fwd_out
+            for mb in range(M):
+                fwd_out[mb].backward(engine._recv_grad())
+
+    elif role == RecoveryRole.UPSTREAM_HELPER:
+        # rank 1..K-2 的 helper（rank K-1 不会是 helper，因为它已是 ring 末端）
         if use_graph:
-            # 路径 A：直接用保留图 backward，跳过重做 forward
             for mb in range(M):
                 g_inp, g_out = engine.cache.get_graph(ckpt_step, mb)
-                if rank > 0 and g_inp.grad is not None:
+                if g_inp.grad is not None:
                     g_inp.grad = None
                 g_out.backward(engine._recv_grad())
-                if rank > 0:
-                    engine._send_grad(g_inp.grad)
+                engine._send_grad(g_inp.grad)
             engine.cache.release_graph_explicitly()
         else:
-            # 路径 B：无保留图，退化为重做 forward + backward
             loc_in, loc_out = [], []
             for mb in range(M):
                 src = fwd_in[mb]
-                inp = src.clone() if rank == 0 else src.clone().requires_grad_(True)
+                inp = src.clone().requires_grad_(True)
                 loc_in.append(inp)
                 loc_out.append(engine.stage(inp))
             for mb in range(M):
                 loc_out[mb].backward(engine._recv_grad())
-                if rank > 0:
-                    engine._send_grad(loc_in[mb].grad)
+                engine._send_grad(loc_in[mb].grad)
+
     else:
-        # PREEMPTED / DOWNSTREAM_VICTIM
+        # PREEMPTED / DOWNSTREAM_VICTIM on rank 1..K-1
         for mb in range(M):
             if rank == K - 1:
-                losses[mb].backward()
+                g = engine._recv_grad_from_head()
+                fwd_out[mb].backward(g)
                 engine._send_grad(fwd_in[mb].grad)
-            elif rank == 0:
-                fwd_out[mb].backward(engine._recv_grad())
             else:
                 fwd_out[mb].backward(engine._recv_grad())
                 engine._send_grad(fwd_in[mb].grad)
@@ -160,7 +205,7 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
     compute_sec = time.monotonic() - t0
 
     final_loss = (sum(l.item() for l in losses)
-                  if rank == K - 1 else None)
+                  if rank == 0 else None)
 
     return {
         "activation_resend_sec":    resend_sec,
