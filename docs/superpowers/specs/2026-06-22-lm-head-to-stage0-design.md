@@ -181,9 +181,12 @@ for mb in range(M):
 
 原规则：`do_retain_here = do_retain and (self.rank < self.K - 1)`，例外是因为旧 rank K-1 自己算 loss + backward 不需保留图给别人。
 
-新规则：`do_retain_here = do_retain`（去掉例外）。理由：
+新规则：`do_retain_here = do_retain and (self.rank != self.K - 1)`。理由：
 
-- rank K-1 现在与中间 stage 同性质（forward 完 send，等 grad 回来才 backward），所以也需要保留图供 UPSTREAM_HELPER 路径复用
+- 表面上 K-1 现在与中间 stage 结构同形（forward 完 send hidden，等 grad 回来才 backward），看似也该保留图
+- 但按 `plan_recovery` 定义，UPSTREAM_HELPER 只分配给 `rank < target_rank` 的 rank，而 `target_rank ≤ K-1`，所以 **K-1 永远不会成为 UPSTREAM_HELPER**
+- 保留的图在 K-1 上不会被任何恢复路径消费（recovery_protocol 第 172 行注释明确："rank K-1 不会是 helper，因为它已是 ring 末端"），是无消费者的死内存
+- 因此排除 K-1，与原版的 `< K-1` 例外语义一致，但理由不再是"K-1 自己 backward"，而是"K-1 不可能是 helper"
 - rank 0 的 **embed 段**仍走原 `_forward_with_clones` 路径保留图（它是 helper）
 - rank 0 的 **head 段** 不走 cloned-params 路径：它是 loss 的本地终点，backward 走 stage 原始参数；`retain_graph` 在 head 段无意义（每个 mb 一次性 backward 完即释放）
 

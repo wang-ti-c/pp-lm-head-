@@ -6,12 +6,14 @@ Ring 拓扑差异：
                                    _send_grad_to_tail   / _recv_grad_from_head
   · rank 0 既驱动 embed forward（送给 rank 1），又消费来自 rank K-1 的 hidden 跑 head + loss
   · rank K-1 退化为中间 stage 同构：forward 完把 hidden 发回 rank 0，等 grad 回来 backward
-  · do_retain_here 不再排除 K-1 —— K-1 现在与中间 stage 同性质，参与保留图
+  · do_retain_here 仍排除 K-1 —— Ring 拓扑下 K-1 结构同构于中间 stage，
+    但按 plan_recovery 定义 K-1 永远不会成为 UPSTREAM_HELPER，
+    保留的图无消费者，排除它避免无谓显存
 
 retain_graph 行为：
   · rank 0 的 embed 段：与原版一致，走 functional_call + cloned params 路径
   · rank 0 的 head 段：每 mb backward 后图自动释放，无需保留
-  · rank K-1：与中间 stage 同形态，参与 retain_graph_interval 节奏
+  · rank K-1：与中间 stage 同形态，但不参与 retain_graph_interval（无消费者）
 """
 import torch
 import torch.distributed as dist
@@ -110,28 +112,16 @@ class PPEngine:
         """
         cloned = {n: p.detach().clone().requires_grad_(True)
                   for n, p in self.stage.named_parameters()}
-        # 临时替换 stage 参数指针 → cloned
-        originals = {}
-        for n, p in list(self.stage.named_parameters()):
-            originals[n] = p
-        # 用 functional_call 的官方接口实现"在 cloned 参数下调用任意方法"：
-        # torch.func.functional_call 支持传 (module, params, args)，会调用 module.__call__。
-        # 但 StageFirst 的 __call__ 不可用。所以我们用 stateless functional_call 的内部 trick：
-        # 通过子模块包装。简单做法：临时 monkey-patch self.stage.forward。
+        # 通过 monkey-patch self.stage.forward 让 functional_call 调用指定方法。
+        # nn.Module 的 forward 始终在基类定义（默认 raise NotImplementedError），
+        # 所以 hasattr(self.stage, "forward") 恒为 True，无需 None 分支兜底。
         method = getattr(self.stage, method_name)
-        saved_forward = self.stage.forward if hasattr(self.stage, "forward") else None
+        saved_forward = self.stage.forward
         self.stage.forward = method  # type: ignore[assignment]
         try:
             out = functional_call(self.stage, cloned, (inp,))
         finally:
-            if saved_forward is None:
-                # nn.Module 总有 forward（默认 raise NotImplementedError）；删除我们设的属性
-                try:
-                    del self.stage.forward
-                except AttributeError:
-                    pass
-            else:
-                self.stage.forward = saved_forward  # type: ignore[assignment]
+            self.stage.forward = saved_forward  # type: ignore[assignment]
         return out, cloned
 
     def _transfer_grads(self, cloned_params: dict):
@@ -151,8 +141,11 @@ class PPEngine:
         self.current_step = step_id
         do_retain = (self.retain_graph_interval > 0
                      and step_id % self.retain_graph_interval == 0)
-        # Ring 拓扑：K-1 现在与中间 stage 同性质，所有 rank 都参与
-        do_retain_here = do_retain
+        # Ring 拓扑下 K-1 与中间 stage 结构同构，但按 plan_recovery 的定义
+        # K-1 永远不会是 UPSTREAM_HELPER（HELPER 只分配给 rank < target_rank，
+        # 而 target_rank ≤ K-1），所以 K-1 保留的图永远没有消费者。
+        # 排除 K-1，避免无谓的峰值显存占用。
+        do_retain_here = do_retain and (self.rank != self.K - 1)
 
         optimizer.zero_grad()
         fwd_in:    list = []

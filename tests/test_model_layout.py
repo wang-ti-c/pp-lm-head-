@@ -21,9 +21,13 @@ def test_stage_first_has_head_and_ln_f():
 def test_stage_first_no_legacy_forward():
     """StageFirst.forward must be removed; only forward_embed / forward_head exist."""
     s = StageFirst(_cfg())
-    # __call__ inherits forward from nn.Module; we want it to NOT be a usable
-    # entry — calling it on a token id tensor must NOT silently work the old way.
-    # We assert the two new methods exist:
+    # StageFirst must NOT override nn.Module.forward — this is the invariant
+    # that pp_engine._forward_with_clones_method's monkey-patch cleanup relies on
+    # (when the cleanup restores forward, the inherited base-class forward must
+    # take over and raise NotImplementedError, not a stale override).
+    assert "forward" not in StageFirst.__dict__, \
+        "StageFirst must not override nn.Module.forward"
+    # Both new entry-point methods must exist:
     assert callable(getattr(s, "forward_embed", None))
     assert callable(getattr(s, "forward_head", None))
 
