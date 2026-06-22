@@ -66,11 +66,13 @@ def make_batch(step: int, total_size: int, seq_len: int,
 
 
 def get_step_data(step, rank, K, M, mb_size, seq_len, vocab_size, seed):
-    """返回 (input_ids_or_None, targets_or_None)。中间 rank 两者均为 None。"""
-    if rank not in (0, K - 1):
+    """返回 (input_ids_or_None, targets_or_None)。
+    Ring 拓扑：rank 0 同时拿 input_ids 和 targets（loss 在 rank 0 算）；
+    其他 rank 两者均为 None。"""
+    if rank != 0:
         return None, None
     ids, tgts = make_batch(step, M * mb_size, seq_len, vocab_size, seed)
-    return (ids, None) if rank == 0 else (None, tgts)
+    return ids, tgts
 
 
 # ── 工具 ─────────────────────────────────────────────────────────────────────
@@ -327,10 +329,10 @@ def main():
     pre_loss = engine.step(b_inj, t_inj, optimizer, step_id=inject_step)
     dist.barrier()
 
-    # 广播 pre_loss（只有 rank K-1 有值）
+    # 广播 pre_loss（Ring 拓扑：只有 rank 0 有值）
     pre_t = torch.tensor([float(pre_loss)], device=f"cuda:{local_rank}",
                           dtype=torch.float32)
-    dist.broadcast(pre_t, src=K - 1)
+    dist.broadcast(pre_t, src=0)
     pre_preemption_loss = float(pre_t[0])
 
     if rank == 0:
@@ -428,11 +430,11 @@ def main():
         b, t = get_step_data(step, rank, K, M, mb_size, seq_len, V, seed)
         loss = engine.step(b, t, optimizer, step_id=step)
         dist.barrier()
-        if rank == K - 1:
+        if rank == 0:
             loss_traj.append({"step": step, "loss": round(float(loss), 6)})
 
-    # ── Phase E：写 JSON（rank K-1）───────────────────────────────────────────
-    if rank == K - 1:
+    # ── Phase E：写 JSON（Ring 拓扑：rank 0 持有 loss）─────────────────────────
+    if rank == 0:
         rec_loss  = rt.get("final_loss")
         tolerance = inj.get("catch_up_tolerance", 0.05)
         loss_gap  = (abs(float(rec_loss) - pre_preemption_loss)
