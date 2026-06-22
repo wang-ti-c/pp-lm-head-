@@ -23,6 +23,49 @@ NCCL 启动开销盖住,几乎为 0)。
 
 每 stage 显存估算(fp32 + AdamW state + retained graph):≈ 14–15 GB,A100 80G 充裕。
 
+## Ring 拓扑（本次改造）
+
+LM head（`ln_f` + `lm_head`）从 stage K-1 永久迁移到 stage 0，数据流由线性
+`0→1→2→3` 变为 ring `0→1→2→3→0`：
+
+```
+forward（per microbatch）:
+  rank 0  : input_ids → tok_emb+pos_emb → 8 blocks → hidden_h0      send → 1
+  rank 1  : hidden_h0 → 8 blocks → hidden_h1                          send → 2
+  rank 2  : hidden_h1 → 8 blocks → hidden_h2                          send → 3
+  rank 3  : hidden_h2 → 8 blocks → hidden_h3                          send → 0  ← 新通道
+  rank 0  : hidden_h3 → ln_f → lm_head → logits → cross_entropy → loss
+
+backward:
+  rank 0  : loss.backward() → grad_h3                                 send → 3  ← 新通道
+  rank 3  : recv grad_h3, blocks.backward → grad_h2                  send → 2
+  rank 2  : ... → grad_h1                                              send → 1
+  rank 1  : ... → grad_h0                                              send → 0
+  rank 0  : recv grad_h0, blocks+emb.backward
+```
+
+两个新增 P2P 通道：`K-1 → 0`（forward hidden）和 `0 → K-1`（backward grad）。
+其余 `0→1→2→3` / `3→2→1→0` 通道保持不变。
+
+### Stage 容量与部署建议（GPT-2 XL，~1.6B 总）
+
+| stage | 参数构成 | 大小 | 部署建议 |
+|---|---|---|---|
+| 0 | tok_emb + pos_emb + 8 blocks + ln_f + lm_head | **~610M** | **ondemand**（最重，恢复代价最高）|
+| 1 | 8 blocks | ~400M | spot |
+| 2 | 8 blocks | ~400M | spot |
+| 3 | 8 blocks | ~400M | spot |
+
+把恢复成本高的 stage 集中到 ondemand，其余放 spot —— 这是本次改造的业务动机。
+
+### 范围限制（本次改造）
+
+- 仅修改 sync 恢复路径（`execute_recovery_sync`）
+- async 1F1B 恢复路径（`execute_recovery_async`）保持原样，作为后续 spec
+- `plan_recovery` 角色映射语义不变
+- 不做 weight tying
+- 不调整 `num_layers_per_stage`（stage 容量不均衡是本实验要观测的现象）
+
 ## 与前三组的关系
 
 | 包 | 恢复阶段调度 | 主要瓶颈 |
@@ -169,8 +212,10 @@ pytest tests/test_async_recovery.py -v
 
 | 文件 | 状态 |
 |---|---|
-| `recovery_protocol.py` | 重写:拆分 `execute_recovery_sync` / `execute_recovery_async` |
-| `run_injection_v2.py` | 小改:按 config 分派 sync/async,JSON 多两字段 |
+| `model.py` | **本次改造**：StageFirst 双方法 (forward_embed/forward_head)，StageLast 移除 head |
+| `pp_engine.py` | **本次改造**：新增 4 个 ring-closure 通信原语，step() 重写，rank 0 owns loss |
+| `recovery_protocol.py` | **本次改造**：execute_recovery_sync 重写（async 路径不动）|
+| `run_injection_v2.py` | **本次改造**：6 处 rank K-1 ownership 翻转为 rank 0 |
 | `analyze_v2.py` | 小改:新增 `overlap_sec` 列、`async_used` 列 |
 | `configs/v2.yaml` | **本包改动**:放大到 GPT-2 XL 量级;`async_pipeline: true` |
 | `configs/v2_sync.yaml` | **本包新增**:三档对照之 graph-opt(`async_pipeline: false`,图保留 ON) |
