@@ -1,10 +1,13 @@
 """
 Pipeline-parallel GPT stage 模型（纯 PyTorch，无外部依赖）。
 
-按 stage 切分：
-  Stage 0      : Embedding + 前 L 层 Transformer
+Ring 拓扑布局（LM head 集中到 stage 0）：
+  Stage 0      : Embedding + L 层 Transformer + final LN + LM Head
+                 forward 拆成两个具名方法对应 ring 上两个物理时机：
+                   · forward_embed(input_ids) → hidden     (mb 起始)
+                   · forward_head(hidden)     → logits      (mb 末尾，从 rank K-1 收回)
   Stage 1..K-2 : 中间 L 层 Transformer
-  Stage K-1    : 后 L 层 Transformer + final LN + LM Head
+  Stage K-1    : 纯 L 层 Transformer（无 ln_f，无 lm_head）—— forward 完把 hidden 发回 rank 0
 """
 import torch
 import torch.nn as nn
@@ -51,7 +54,13 @@ class TransformerBlock(nn.Module):
 
 
 class StageFirst(nn.Module):
-    """Stage 0: token embedding + position embedding + L Transformer blocks"""
+    """Stage 0: 双重职责。
+
+    forward_embed: input_ids → hidden_h0    （mb 起始，发给 rank 1）
+    forward_head : hidden_hK → logits        （mb 末尾，从 rank K-1 收回；后续接 cross_entropy）
+
+    注意：__call__ / forward 不暴露，调用方必须显式选择两个方法之一。
+    """
     def __init__(self, cfg):
         super().__init__()
         H = cfg["hidden_dim"]
@@ -62,14 +71,19 @@ class StageFirst(nn.Module):
             [TransformerBlock(H, cfg["num_heads"], cfg["dropout"])
              for _ in range(cfg["num_layers_per_stage"])]
         )
+        self.ln_f    = nn.LayerNorm(H)
+        self.lm_head = nn.Linear(H, cfg["vocab_size"], bias=False)
 
-    def forward(self, input_ids):
+    def forward_embed(self, input_ids):
         B, T = input_ids.shape
         pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
         x = self.drop(self.tok_emb(input_ids) + self.pos_emb(pos))
         for blk in self.blocks:
             x = blk(x)
         return x
+
+    def forward_head(self, hidden):
+        return self.lm_head(self.ln_f(hidden))
 
 
 class StageMiddle(nn.Module):
@@ -89,7 +103,11 @@ class StageMiddle(nn.Module):
 
 
 class StageLast(nn.Module):
-    """Stage K-1: L Transformer blocks + final LN + LM head"""
+    """Stage K-1: 纯 L 层 Transformer。
+
+    Ring 拓扑下结构等同 StageMiddle —— forward 完把 hidden 通过新通道发回 rank 0。
+    保留独立类是为 build_stage() 的角色身份清晰；不复制为 StageMiddle 别名。
+    """
     def __init__(self, cfg):
         super().__init__()
         H = cfg["hidden_dim"]
@@ -97,13 +115,11 @@ class StageLast(nn.Module):
             [TransformerBlock(H, cfg["num_heads"], cfg["dropout"])
              for _ in range(cfg["num_layers_per_stage"])]
         )
-        self.ln_f    = nn.LayerNorm(H)
-        self.lm_head = nn.Linear(H, cfg["vocab_size"], bias=False)
 
     def forward(self, x):
         for blk in self.blocks:
             x = blk(x)
-        return self.lm_head(self.ln_f(x))
+        return x
 
 
 def build_stage(rank: int, num_stages: int, cfg: dict) -> nn.Module:
