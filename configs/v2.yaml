@@ -50,8 +50,10 @@ injection:
 
   retain_graph_interval: 10
 
-  nccl_timeout_sec: 60
-  recovery_nccl_timeout_sec: 60
+  # 60 → 600:Ring 拓扑 (0→1, 1→2, 2→3, 3→0) 首个 P2P 会 lazy 建 4 条 2-rank sub-comm,
+  # 每条建 comm 需要 TCP+CUDA IPC+ 握手,A100 集群实测串起来 60s 常常不够,改到 10min。
+  nccl_timeout_sec: 600
+  recovery_nccl_timeout_sec: 600
   recovery_port: 29501
   coord_dir: /workspace/runs/async/coord
 

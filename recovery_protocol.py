@@ -25,6 +25,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from pair_groups import ensure_pair_groups, pair_group, pair_send, pair_recv
+
 
 class RecoveryRole(Enum):
     UPSTREAM_HELPER   = "upstream_helper"
@@ -68,6 +70,12 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
 
     use_graph = (role == RecoveryRole.UPSTREAM_HELPER
                  and engine.cache.has_graph(ckpt_step))
+
+    # Bootstrap pair sub-PGs on the FRESH default PG (Phase B just rebuilt it).
+    # engine.step() also calls this, but during recovery the PG is new,
+    # so the cache invalidates and rebuilds here — must run before any P2P.
+    # Collective on default PG → all ranks must call in lock-step.
+    ensure_pair_groups(K, engine.device)
 
     optimizer.zero_grad()
 
@@ -226,7 +234,8 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
 # 通信原语:借鉴 Bamboo (NSDI'23) 的 p2p.py 实现
 #   uclasystem/bamboo:external/deepspeed/deepspeed/runtime/pipe/p2p.py
 # 关键设计:
-#   1) 在重建 default PG 之后,为每对相邻 rank 单独 dist.new_group([i, i+1])
+#   1) 在重建 default PG 之后,为每条通信边单独建 dist.new_group:
+#      相邻边 [i, i+1] 加上 ring closure [0, K-1]
 #      → 每个 pair 拥有独立的 NCCL communicator,不受 default PG eager-init
 #      mode 下 P2P sub-comm 创建竞争的影响。
 #   2) 用 dist.broadcast(tensor, src_rank, group=pair_group) 模拟 P2P:
@@ -244,90 +253,10 @@ def execute_recovery_sync(plan, engine, ckpt_step, resume_step,
 # 数值不变量:每个 mb 的张量来源/去向、graph 使用方式与 sync 版完全一致。
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Pair-group cache, keyed by (lower_rank, higher_rank); value is the
-# ProcessGroup created via dist.new_group. Built once per recovery (cheap,
-# but we cache across calls within the same default PG so repeated trials
-# reuse the same sub-PGs).
-_PAIR_GROUPS: dict = {}
-# default-PG fingerprint we used last; if it changes (Phase B re-init),
-# the cache is invalidated.
-_PAIR_GROUPS_PG_ID: int | None = None
-
-
-def _ensure_pair_groups(K: int, device):
-    """
-    Idempotently create dist.new_group([i, i+1]) for every adjacent pair.
-    Must be called by ALL ranks in lock-step (collective op).
-
-    Detects default-PG re-init (after a Phase B preemption) by comparing
-    the id() of the default group; if it changed, the previous pair-group
-    handles point to a stale comm and we rebuild.
-    """
-    global _PAIR_GROUPS, _PAIR_GROUPS_PG_ID
-
-    default_pg = dist.distributed_c10d._get_default_group()
-    cur_id = id(default_pg)
-    if _PAIR_GROUPS_PG_ID != cur_id:
-        _PAIR_GROUPS.clear()
-        _PAIR_GROUPS_PG_ID = cur_id
-
-    rank = dist.get_rank()
-    one  = torch.zeros(1, device=device, dtype=torch.float32)
-    zero = torch.zeros(1, device=device, dtype=torch.float32)
-
-    # NOTE: dist.new_group is a COLLECTIVE — every rank in the default PG
-    # must call it the same number of times in the same order, even if it
-    # is not a member of the new group. We iterate pairs in fixed order.
-    for src in range(K - 1):
-        dst = src + 1
-        key = (src, dst)
-        if key not in _PAIR_GROUPS:
-            grp = dist.new_group(ranks=[src, dst])
-            _PAIR_GROUPS[key] = grp
-            # Warm-up: only the two ranks in the group participate.
-            # One broadcast per rank, identical schedule on both sides.
-            if rank == src:
-                dist.broadcast(one, src=src, group=grp)
-                dist.broadcast(zero, src=dst, group=grp)
-            elif rank == dst:
-                dist.broadcast(one, src=src, group=grp)
-                dist.broadcast(zero, src=dst, group=grp)
-            # other ranks: idle (not a member of grp; calling broadcast on
-            # it from a non-member would error)
-
-
-def _pair_group(a: int, b: int):
-    lo, hi = min(a, b), max(a, b)
-    return _PAIR_GROUPS[(lo, hi)]
-
-
-def _p2p_send_async(tensor: torch.Tensor, dst: int):
-    """
-    Asynchronously send tensor via the 2-rank pair PG.
-    Returns the Work handle; caller is responsible for waiting before reusing
-    the buffer (handled by _drain_pending_sends at end-of-recovery).
-
-    Async send is REQUIRED to break the 1F1B chicken-egg: rank K-1 must be
-    able to issue _send_grad without waiting for rank K-2 to be ready to
-    recv, so it can proceed to the next forward. NCCL pairs the eventual
-    recv with this enqueued send.
-    """
-    grp = _pair_group(dist.get_rank(), dst)
-    return dist.broadcast(tensor.contiguous(), src=dist.get_rank(),
-                          group=grp, async_op=True)
-
-
-def _p2p_recv_sync(tensor: torch.Tensor, src: int):
-    """
-    Synchronously receive into caller buffer via the 2-rank pair PG.
-    Blocks until the matching async send on the peer is enqueued.
-
-    Recv stays synchronous because the consumer needs the data immediately
-    to feed the next op. Hangs are bounded by NCCL's heartbeat timeout.
-    """
-    grp = _pair_group(src, dist.get_rank())
-    dist.broadcast(tensor, src=src, group=grp)
-
+# Pair-sub-PG creation + P2P helpers moved to pair_groups.py so training
+# (pp_engine.py) shares one warmed-up cache with recovery. Async recovery's
+# extra requirements — async_op send handles + explicit drain at end —
+# stay here as thin wrappers around pair_groups.pair_send/pair_recv.
 
 # In-flight async sends; all are .wait()ed at end of recovery to ensure
 # their buffers (especially cloned grads) outlive the NCCL transfer.
@@ -335,29 +264,50 @@ _PENDING_SENDS: list = []
 
 
 def _send_act(engine, x, dst):
-    work = _p2p_send_async(x.contiguous(), dst)
+    """
+    Async send via pair sub-PG. Handle is queued for end-of-recovery drain.
+    Async is REQUIRED for 1F1B: rank K-1 must issue send without waiting
+    for K-2 to recv, so it can proceed to the next forward.
+    """
+    work = pair_send(x.contiguous(), dst=dst, async_op=True)
     _PENDING_SENDS.append(work)
 
 
 def _recv_act(engine, src):
     buf = torch.empty((engine.mb_size, engine.seq_len, engine.H),
                       device=engine.device, dtype=torch.float32)
-    _p2p_recv_sync(buf, src)
+    pair_recv(buf, src=src)
     return buf
 
 
 def _send_grad(engine, g, dst):
-    # Clone before send: async send returns immediately, the .grad field
-    # may be cleared by the next backward before NCCL finishes transmitting.
-    work = _p2p_send_async(g.detach().clone().contiguous(), dst)
+    # Clone before async send: the .grad field may be cleared by the next
+    # backward before NCCL finishes transmitting.
+    work = pair_send(g.detach().clone().contiguous(), dst=dst, async_op=True)
     _PENDING_SENDS.append(work)
 
 
 def _recv_grad(engine, src):
     buf = torch.empty((engine.mb_size, engine.seq_len, engine.H),
                       device=engine.device, dtype=torch.float32)
-    _p2p_recv_sync(buf, src)
+    pair_recv(buf, src=src)
     return buf
+
+
+def _send_hidden_to_head(engine, x):
+    _send_act(engine, x, dst=0)
+
+
+def _recv_hidden_from_tail(engine):
+    return _recv_act(engine, src=engine.K - 1)
+
+
+def _send_grad_to_tail(engine, g):
+    _send_grad(engine, g, dst=engine.K - 1)
+
+
+def _recv_grad_from_head(engine):
+    return _recv_grad(engine, src=0)
 
 
 def _drain_pending_sends():
@@ -399,9 +349,11 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
 
     optimizer.zero_grad()
 
-    # Bamboo-style: pre-create + warm-up every adjacent-pair sub-PG.
+    # Bamboo-style: pre-create + warm-up every pipeline-edge sub-PG,
+    # including the K-1 → 0 / 0 → K-1 ring-closure edge.
     # All ranks call this in lock-step — it's a collective op sequence.
-    _ensure_pair_groups(K, engine.device)
+    # Shared with training (pp_engine.step) and sync recovery via pair_groups.
+    ensure_pair_groups(K, engine.device)
     # Defensive: clear any send-handles left over from a prior trial.
     _drain_pending_sends()
 
@@ -414,11 +366,11 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
     #     "recompute"       helper no graph → (loc_in, loc_out)
     #     "preempt0"        rank-0 preempted   → (inp, out)
     #     "preempt_mid"     middle preempted   → (fwd_in, fwd_out)
-    #     "preempt_last"    rank K-1 preempted → (inp, loss)
+    #     "preempt_last"    rank K-1 preempted → (fwd_in, fwd_out)
     #     "downstream_mid"  middle downstream  → (fwd_in, fwd_out)
-    #     "downstream_last" rank K-1 downstrm  → (inp, loss)
+    #     "downstream_last" rank K-1 downstrm  → (fwd_in, fwd_out)
     fwd_ctx: dict = {}
-    losses: list = []                 # rank K-1 accumulates here
+    losses: list = []                 # rank 0 accumulates head/loss here
 
     # Wall-clock tracking
     t_total_start = time.monotonic()
@@ -460,7 +412,7 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
                 # recomputed `out` to backward on.
                 cached_inp, cached_out = engine.cache.get(ckpt_step, mb)
                 inp = cached_inp.clone() if rank == 0 else cached_inp.clone().requires_grad_(True)
-                out = engine.stage(inp)
+                out = engine.stage.forward_embed(inp) if rank == 0 else engine.stage(inp)
                 fwd_ctx[mb] = ("recompute", inp, out)
                 _send_act(engine, cached_out, dst=rank + 1)
                 _mark_send()
@@ -469,18 +421,16 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
             if rank == 0:
                 s = mb * engine.mb_size
                 inp = batch_input_ids[s:s + engine.mb_size].to(engine.device)
-                out = engine.stage(inp)
+                out = engine.stage.forward_embed(inp)
                 fwd_ctx[mb] = ("preempt0", inp, out)
                 _send_act(engine, out, dst=rank + 1)
                 _mark_send()
             elif rank == K - 1:
                 inp = _recv_act(engine, src=rank - 1); inp.requires_grad_(True)
-                logits = engine.stage(inp)
-                s = mb * engine.mb_size
-                tgt = batch_targets[s:s + engine.mb_size].to(engine.device)
-                loss = F.cross_entropy(logits.view(-1, engine.V), tgt.view(-1)) / M
-                losses.append(loss)
-                fwd_ctx[mb] = ("preempt_last", inp, loss)
+                out = engine.stage(inp)
+                fwd_ctx[mb] = ("preempt_last", inp, out)
+                _send_hidden_to_head(engine, out)
+                _mark_send()
             else:
                 inp = _recv_act(engine, src=rank - 1); inp.requires_grad_(True)
                 out = engine.stage(inp)
@@ -491,12 +441,10 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
         else:  # DOWNSTREAM_VICTIM
             if rank == K - 1:
                 inp = _recv_act(engine, src=rank - 1); inp.requires_grad_(True)
-                logits = engine.stage(inp)
-                s = mb * engine.mb_size
-                tgt = batch_targets[s:s + engine.mb_size].to(engine.device)
-                loss = F.cross_entropy(logits.view(-1, engine.V), tgt.view(-1)) / M
-                losses.append(loss)
-                fwd_ctx[mb] = ("downstream_last", inp, loss)
+                out = engine.stage(inp)
+                fwd_ctx[mb] = ("downstream_last", inp, out)
+                _send_hidden_to_head(engine, out)
+                _mark_send()
             else:
                 inp = _recv_act(engine, src=rank - 1); inp.requires_grad_(True)
                 out = engine.stage(inp)
@@ -508,6 +456,18 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
 
     def do_backward(mb):
         kind = fwd_ctx[mb][0]
+
+        if rank == 0:
+            hidden = _recv_hidden_from_tail(engine)
+            hidden.requires_grad_(True)
+            logits = engine.stage.forward_head(hidden)
+            s = mb * engine.mb_size
+            tgt = batch_targets[s:s + engine.mb_size].to(engine.device)
+            loss = F.cross_entropy(logits.view(-1, engine.V), tgt.view(-1)) / M
+            losses.append(loss)
+            loss.backward()
+            _send_grad_to_tail(engine, hidden.grad)
+            _mark_send()
 
         if kind == "graph":
             _, g_inp, g_out = fwd_ctx[mb]
@@ -543,8 +503,9 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
             _mark_send()
 
         elif kind in ("preempt_last", "downstream_last"):
-            _, inp, loss = fwd_ctx[mb]
-            loss.backward()
+            _, inp, out = fwd_ctx[mb]
+            grad_out = _recv_grad_from_head(engine)
+            out.backward(grad_out)
             _send_grad(engine, inp.grad, dst=rank - 1)
             _mark_send()
 
@@ -600,7 +561,7 @@ def execute_recovery_async(plan, engine, ckpt_step, resume_step,
     overlap_sec = max(0.0, resend_sec + compute_sec - t_total)
 
     final_loss = (sum(l.item() for l in losses)
-                  if rank == K - 1 else None)
+                  if rank == 0 else None)
 
     return {
         "activation_resend_sec":    resend_sec,

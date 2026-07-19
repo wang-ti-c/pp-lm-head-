@@ -203,9 +203,9 @@ def test_async_returns_required_fields():
         assert ret["recovery_compute_sec"] >= 0.0
         assert "stages_resent_activation" in ret
         assert "stages_recomputed_forward" in ret
-    # Only the last rank has final_loss.
-    assert results[K - 1]["final_loss"] is not None
-    for r in range(K - 1):
+    # Ring layout: rank 0 owns lm_head/loss.
+    assert results[0]["final_loss"] is not None
+    for r in range(1, K):
         assert results[r]["final_loss"] is None
 
 
@@ -261,7 +261,7 @@ def _final_loss_for_mode(mode):
         for p in procs:
             p.join(timeout=10)
             assert p.exitcode == 0, f"rank crashed (exitcode={p.exitcode})"
-    return losses[K - 1]
+    return losses[0]
 
 
 @pytest.mark.skip(reason=(

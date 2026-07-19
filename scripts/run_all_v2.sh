@@ -104,7 +104,11 @@ eval "$(parse_cfg_paths "${CONFIG}")"
 CFG_TAG=$(basename "${CONFIG}" .yaml)
 
 mkdir -p "${CKPT_DIR}" "${RESULTS_DIR}" "${LOGS_DIR}" "${COORD_DIR}"
-DOWNLOAD_ROOT="/workspace/downloads"
+# bitahub 分布式训练容器的 /workspace/downloads 会随 job 销毁,SSH/Jupyter
+# 拿不到。把打包目录放到 ${CODE_DIR}/_results (代码目录内),这样 job 期间
+# 写入的 tar.gz 在 job 结束后依然留在挂载的代码目录里,SSH/Jupyter 直接可见。
+# 允许外部覆盖: DOWNLOAD_ROOT=/some/path bash run_all_v2.sh ...
+DOWNLOAD_ROOT="${DOWNLOAD_ROOT:-${CODE_DIR}/_results}"
 mkdir -p "${DOWNLOAD_ROOT}"
 
 # master_ip.txt 也按 RUN_TAG 分,这样三档并发跑时 rank 0 互不覆盖

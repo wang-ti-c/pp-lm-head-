@@ -8,11 +8,12 @@ run_injection_v2) rely on:
 """
 import os
 import sys
+import inspect
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import build_stage, StageFirst, StageLast
-from recovery_protocol import plan_recovery, RecoveryRole
+from recovery_protocol import plan_recovery, RecoveryRole, execute_recovery_async
 
 
 def _cfg():
@@ -69,3 +70,13 @@ def test_plan_recovery_target_K_minus_1():
     for r in (0, 1, 2):
         assert plan[r] == RecoveryRole.UPSTREAM_HELPER
     assert plan[3] == RecoveryRole.PREEMPTED
+
+
+def test_async_recovery_uses_ring_head_on_stage0():
+    """Async recovery must preserve the ring invariant: rank 0 owns head/loss."""
+    src = inspect.getsource(execute_recovery_async)
+    assert "_send_hidden_to_head" in src
+    assert "_recv_hidden_from_tail" in src
+    assert "forward_head" in src
+    assert "final_loss = (sum(l.item() for l in losses)\n                  if rank == 0 else None)" in src
+    assert "logits = engine.stage(inp)" not in src

@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.func import functional_call
 
 from activation_cache import ActivationCache
+from pair_groups import ensure_pair_groups, pair_send, pair_recv
 
 
 class PPEngine:
@@ -46,48 +47,55 @@ class PPEngine:
         self.current_step    = -1
         self.last_graph_step = None
 
-    # ── 通信原语（链式） ──────────────────────────────────────────────────────
+    # ── 通信原语（链式 + ring 回传） ─────────────────────────────────────────
+    #
+    # 所有 P2P 都走 pair sub-PG broadcast，不再用 raw dist.send/recv。
+    # 原因 (2026-07 fix)：NCCL 2.19+ 对 4-rank PG 上的 P2P 采用 LAZY 2-rank
+    # sub-comm 创建，而该创建是父 PG 上的隐式 collective。Ring 拓扑下
+    # (0→1, 1→2, 2→3, 3→0) 4 条边在不同 rank 上首次触达顺序不同 → 死锁,
+    # 每个 rank 在第一个 forward mb 上 hang 满 timeout。observed on
+    # A100 x4, NCCL 2.27.5, 训练 warmup step 1 一步都过不去。
+    # 解法: pair_groups 模块预建 4 条 pair sub-PG + warm-up，业务通信
+    # 走 broadcast(src=lo, group=pair_group)，等价 send/recv 但零 lazy-init。
 
     def _recv_act(self):
         buf = torch.empty((self.mb_size, self.seq_len, self.H),
                           device=self.device, dtype=torch.float32)
-        dist.recv(buf, src=self.rank - 1)
+        pair_recv(buf, src=self.rank - 1)
         return buf
 
     def _send_act(self, x):
-        dist.send(x.contiguous(), dst=self.rank + 1)
+        pair_send(x.contiguous(), dst=self.rank + 1)
 
     def _recv_grad(self):
         buf = torch.empty((self.mb_size, self.seq_len, self.H),
                           device=self.device, dtype=torch.float32)
-        dist.recv(buf, src=self.rank + 1)
+        pair_recv(buf, src=self.rank + 1)
         return buf
 
     def _send_grad(self, g):
-        dist.send(g.contiguous(), dst=self.rank - 1)
-
-    # ── 通信原语（ring 回传） ────────────────────────────────────────────────
+        pair_send(g.contiguous(), dst=self.rank - 1)
 
     def _send_hidden_to_head(self, x):
         """rank K-1 → rank 0：forward 时把最末 hidden 送回 head"""
-        dist.send(x.contiguous(), dst=0)
+        pair_send(x.contiguous(), dst=0)
 
     def _recv_hidden_from_tail(self):
         """rank 0 接收来自 rank K-1 的 hidden（forward 末段）"""
         buf = torch.empty((self.mb_size, self.seq_len, self.H),
                           device=self.device, dtype=torch.float32)
-        dist.recv(buf, src=self.K - 1)
+        pair_recv(buf, src=self.K - 1)
         return buf
 
     def _send_grad_to_tail(self, g):
         """rank 0 → rank K-1：backward 启动时把 grad_hidden 送给 tail"""
-        dist.send(g.contiguous(), dst=self.K - 1)
+        pair_send(g.contiguous(), dst=self.K - 1)
 
     def _recv_grad_from_head(self):
         """rank K-1 接收来自 rank 0 的 grad_hidden（backward 启动）"""
         buf = torch.empty((self.mb_size, self.seq_len, self.H),
                           device=self.device, dtype=torch.float32)
-        dist.recv(buf, src=0)
+        pair_recv(buf, src=0)
         return buf
 
     # ── 参数副本 forward（图优化专用）────────────────────────────────────────
@@ -138,6 +146,11 @@ class PPEngine:
     # ── 训练 step ─────────────────────────────────────────────────────────────
 
     def step(self, batch_input_ids, batch_targets, optimizer, step_id: int):
+        # Bootstrap pair sub-PGs before ANY P2P. Idempotent — re-fires only
+        # if the default PG changed (Phase B rebuild) or on first call.
+        # Must be called by ALL ranks in lock-step (collective).
+        ensure_pair_groups(self.K, self.device)
+
         self.current_step = step_id
         do_retain = (self.retain_graph_interval > 0
                      and step_id % self.retain_graph_interval == 0)
